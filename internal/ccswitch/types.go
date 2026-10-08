@@ -67,6 +67,11 @@ type ProviderInput struct {
 	BaseURL         string
 	APIKey          string
 	Model           string
+	ModelFable      string
+	ModelHaiku      string
+	ModelSonnet     string
+	ModelOpus       string
+	ModelSubagent   string
 	ReasoningEffort string
 	Website         string
 	Notes           string

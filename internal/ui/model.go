@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -17,6 +18,7 @@ const (
 	modeList screenMode = iota
 	modeForm
 	modeConfirm
+	modeModelPicker
 )
 
 type rowKind int
@@ -51,11 +53,32 @@ type formState struct {
 	labels       []string
 	focusIndex   int
 	errorMessage string
+	// modelOptions 是本次表单会话内拉取到的模型列表缓存，避免每换一个字段就重新请求
+	modelOptions       []string
+	modelOptionsSource string
 }
 
 type confirmState struct {
 	app      ccswitch.AppType
 	provider ccswitch.Provider
+}
+
+type pickerState struct {
+	fieldIndex int
+	fieldLabel string
+	cursor     int
+	filter     textinput.Model
+	filtered   []string
+	loading    bool
+	err        string
+	warn       string
+}
+
+type modelOptionsMsg struct {
+	options []string
+	source  string
+	warn    string
+	err     error
 }
 
 type Model struct {
@@ -69,6 +92,7 @@ type Model struct {
 	providers   map[ccswitch.AppType][]ccswitch.Provider
 	form        formState
 	confirm     *confirmState
+	picker      *pickerState
 	status      string
 	statusKind  statusLevel
 	selectedKey string
@@ -141,6 +165,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = typed.Width
 		m.height = typed.Height
 		return m, nil
+	case modelOptionsMsg:
+		// 必须在模式分发之前处理，否则会被表单的字段更新循环吞掉
+		return m.handleModelOptions(typed), nil
 	}
 
 	switch m.mode {
@@ -150,6 +177,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateForm(msg)
 	case modeConfirm:
 		return m.updateConfirm(msg)
+	case modeModelPicker:
+		return m.updateModelPicker(msg)
 	default:
 		return m, nil
 	}
@@ -161,6 +190,8 @@ func (m *Model) View() string {
 		return m.viewForm()
 	case modeConfirm:
 		return m.viewConfirm()
+	case modeModelPicker:
+		return m.viewModelPicker()
 	default:
 		return m.viewList()
 	}
@@ -274,6 +305,13 @@ func (m *Model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "ctrl+s":
 			return m.saveForm()
+		case "ctrl+l":
+			if index, ok := modelFieldIndex(m.form.app, m.form.focusIndex); ok {
+				cmd := m.openModelPicker(index)
+				return m, cmd
+			}
+			m.form.errorMessage = "请先把光标移到 Model 字段再按 Ctrl+L"
+			return m, nil
 		}
 	}
 
@@ -287,6 +325,190 @@ func (m *Model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// modelFieldIndex 判断聚焦字段是否是模型字段，是则返回其下标。
+func modelFieldIndex(app ccswitch.AppType, focus int) (int, bool) {
+	if focus == 3 {
+		return focus, true
+	}
+	if app == ccswitch.AppClaude && focus >= 4 && focus <= 8 {
+		return focus, true
+	}
+	return 0, false
+}
+
+func (m *Model) openModelPicker(fieldIndex int) tea.Cmd {
+	filter := textinput.New()
+	filter.Prompt = ""
+	filter.Placeholder = "输入关键字筛选"
+	filter.CharLimit = 128
+	filter.Width = max(20, min(m.width-16, 60))
+	filter.Focus()
+
+	state := &pickerState{
+		fieldIndex: fieldIndex,
+		fieldLabel: m.form.labels[fieldIndex],
+		filter:     filter,
+	}
+	m.picker = state
+	m.applyPickerFilter()
+	m.movePickerCursorToValue()
+	m.mode = modeModelPicker
+
+	if len(m.form.modelOptions) == 0 {
+		state.loading = true
+		return tea.Batch(textinput.Blink, m.fetchModelOptionsCmd())
+	}
+	return textinput.Blink
+}
+
+func (m *Model) fetchModelOptionsCmd() tea.Cmd {
+	input := m.formInput()
+	baseURL, apiKey := input.BaseURL, input.APIKey
+	return func() tea.Msg {
+		options, source, warn, err := ccswitch.FetchModelOptions(context.Background(), baseURL, apiKey)
+		return modelOptionsMsg{options: options, source: source, warn: warn, err: err}
+	}
+}
+
+func (m *Model) handleModelOptions(msg modelOptionsMsg) tea.Model {
+	if m.mode != modeModelPicker || m.picker == nil {
+		return m
+	}
+
+	m.picker.loading = false
+	if msg.err != nil {
+		m.picker.err = msg.err.Error()
+		return m
+	}
+
+	m.picker.err = ""
+	m.picker.warn = msg.warn
+	m.form.modelOptions = msg.options
+	m.form.modelOptionsSource = msg.source
+	m.applyPickerFilter()
+	m.movePickerCursorToValue()
+	return m
+}
+
+func (m *Model) updateModelPicker(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.picker == nil {
+		m.mode = modeForm
+		return m, nil
+	}
+
+	if key, ok := msg.(tea.KeyMsg); ok {
+		switch key.String() {
+		case "esc":
+			m.mode = modeForm
+			m.picker = nil
+			return m, nil
+		case "enter":
+			if m.picker.loading || len(m.picker.filtered) == 0 {
+				return m, nil
+			}
+			m.form.fields[m.picker.fieldIndex].SetValue(m.picker.filtered[m.picker.cursor])
+			m.form.errorMessage = ""
+			m.mode = modeForm
+			m.picker = nil
+			return m, nil
+		case "ctrl+r":
+			if m.picker.loading {
+				return m, nil
+			}
+			m.picker.loading = true
+			m.picker.err = ""
+			return m, m.fetchModelOptionsCmd()
+		case "up", "ctrl+p":
+			m.movePickerCursor(-1)
+			return m, nil
+		case "down", "ctrl+n":
+			m.movePickerCursor(1)
+			return m, nil
+		case "pgup":
+			m.movePickerCursor(-m.pickerListHeight())
+			return m, nil
+		case "pgdown":
+			m.movePickerCursor(m.pickerListHeight())
+			return m, nil
+		}
+	}
+
+	field, cmd := m.picker.filter.Update(msg)
+	m.picker.filter = field
+	m.applyPickerFilter()
+	return m, cmd
+}
+
+func (m *Model) movePickerCursor(delta int) {
+	if m.picker == nil || len(m.picker.filtered) == 0 {
+		return
+	}
+
+	next := m.picker.cursor + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(m.picker.filtered) {
+		next = len(m.picker.filtered) - 1
+	}
+	m.picker.cursor = next
+}
+
+// movePickerCursorToValue 把光标定位到目标字段当前的值上。
+func (m *Model) movePickerCursorToValue() {
+	if m.picker == nil {
+		return
+	}
+
+	current := strings.TrimSpace(m.form.fields[m.picker.fieldIndex].Value())
+	m.picker.cursor = 0
+	for index, name := range m.picker.filtered {
+		if name == current {
+			m.picker.cursor = index
+			return
+		}
+	}
+}
+
+func (m *Model) applyPickerFilter() {
+	if m.picker == nil {
+		return
+	}
+
+	previous := ""
+	if m.picker.cursor >= 0 && m.picker.cursor < len(m.picker.filtered) {
+		previous = m.picker.filtered[m.picker.cursor]
+	}
+
+	m.picker.filtered = filterModelNames(m.form.modelOptions, m.picker.filter.Value())
+	m.picker.cursor = 0
+	if previous == "" {
+		return
+	}
+
+	for index, name := range m.picker.filtered {
+		if name == previous {
+			m.picker.cursor = index
+			return
+		}
+	}
+}
+
+func filterModelNames(options []string, needle string) []string {
+	needle = strings.ToLower(strings.TrimSpace(needle))
+	if needle == "" {
+		return append([]string(nil), options...)
+	}
+
+	matched := make([]string, 0, len(options))
+	for _, option := range options {
+		if strings.Contains(strings.ToLower(option), needle) {
+			matched = append(matched, option)
+		}
+	}
+	return matched
 }
 
 func (m *Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -560,21 +782,29 @@ func (m *Model) viewForm() string {
 		title = "Edit " + m.form.app.DisplayName() + " Provider"
 	}
 
+	helpLines := m.renderHelpLines()
+	start, end := m.formFieldWindow(len(helpLines))
+
 	lines := []string{
 		panelTitleStyle.Render(title),
 		formHintStyle.Render(m.formHint()),
 		"",
 	}
-	for index, field := range m.form.fields {
+	if start > 0 {
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("▲ 上方还有 %d 项", start)))
+	}
+	for index := start; index < end; index++ {
 		lines = append(lines, labelStyle.Render(m.form.labels[index]))
-		lines = append(lines, field.View())
+		lines = append(lines, m.form.fields[index].View())
 		lines = append(lines, "")
+	}
+	if end < len(m.form.fields) {
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("▼ 下方还有 %d 项", len(m.form.fields)-end)))
 	}
 	if m.form.errorMessage != "" {
 		lines = append(lines, errorStyle.Render(m.form.errorMessage))
 	}
 	panelLines := strings.Split(panelStyle.Width(max(60, min(m.width-4, 100))).Render(strings.Join(lines, "\n")), "\n")
-	helpLines := m.renderHelpLines()
 	page := []string{m.renderHeader(), ""}
 	page = append(page, panelLines...)
 	for len(page)+len(helpLines) < m.height {
@@ -582,6 +812,153 @@ func (m *Model) viewForm() string {
 	}
 	page = append(page, helpLines...)
 	return strings.Join(page, "\n")
+}
+
+const formFieldLines = 3
+
+// pickerListHeight 返回模型选择器中列表可见行数。
+func (m *Model) pickerListHeight() int {
+	// 头部与空行 + 面板边框与内边距 + 标题/空行/筛选/状态/空行 + 帮助行
+	height := m.height - (2 + 4 + 5 + len(m.renderHelpLines()))
+	if height < 3 {
+		height = 3
+	}
+	return height
+}
+
+// pickerWindow 返回模型列表的可见区间，保证光标行可见。
+func (m *Model) pickerWindow() (int, int) {
+	total := len(m.picker.filtered)
+	height := m.pickerListHeight()
+	if total <= height {
+		return 0, total
+	}
+
+	start := m.picker.cursor - height/2
+	if start < 0 {
+		start = 0
+	}
+	if start > total-height {
+		start = total - height
+	}
+	return start, start + height
+}
+
+func (m *Model) viewModelPicker() string {
+	if m.picker == nil {
+		return m.viewForm()
+	}
+
+	helpLines := m.renderHelpLines()
+	panelWidth := max(60, min(m.width-4, 100))
+	contentWidth := max(20, panelWidth-6)
+	listHeight := m.pickerListHeight()
+
+	statusLine := formHintStyle.Render(truncate(m.pickerStatusLine(), contentWidth))
+	switch {
+	case m.picker.loading:
+		statusLine = mutedStyle.Render("正在获取模型列表…")
+	case m.picker.err != "":
+		statusLine = mutedStyle.Render("未获取到模型，按 Ctrl+R 重试")
+	}
+
+	warnLine := ""
+	if m.picker.warn != "" {
+		warnLine = mutedStyle.Render(truncate(m.picker.warn, contentWidth))
+	}
+
+	lines := []string{
+		panelTitleStyle.Render(fmt.Sprintf("选择模型 — %s · %s", m.form.app.DisplayName(), m.picker.fieldLabel)),
+		"",
+		"筛选 " + m.picker.filter.View(),
+		statusLine,
+		warnLine,
+	}
+
+	body := make([]string, 0, listHeight)
+	switch {
+	case m.picker.loading:
+	case m.picker.err != "":
+		// 错误换行展示，避免只看到被截断的 URL 前缀
+		body = append(body, errorStyle.Render("获取失败"))
+		for _, line := range wrapText(m.picker.err, max(16, contentWidth-2)) {
+			if len(body) >= listHeight {
+				break
+			}
+			body = append(body, errorStyle.Render("  "+line))
+		}
+	default:
+		if len(m.picker.filtered) == 0 {
+			body = append(body, mutedStyle.Render("无匹配模型"))
+		} else {
+			start, end := m.pickerWindow()
+			for index := start; index < end; index++ {
+				name := truncate(m.picker.filtered[index], max(12, contentWidth-2))
+				if index == m.picker.cursor {
+					body = append(body, selectedStyle.Render("▶ "+name))
+					continue
+				}
+				body = append(body, "  "+name)
+			}
+		}
+	}
+	for len(body) < listHeight {
+		body = append(body, "")
+	}
+	lines = append(lines, body...)
+
+	panelLines := strings.Split(panelStyle.Width(panelWidth).Render(strings.Join(lines, "\n")), "\n")
+	page := []string{m.renderHeader(), ""}
+	page = append(page, panelLines...)
+	for len(page)+len(helpLines) < m.height {
+		page = append(page, "")
+	}
+	page = append(page, helpLines...)
+	return strings.Join(page, "\n")
+}
+
+func (m *Model) pickerStatusLine() string {
+	if len(m.form.modelOptions) == 0 && m.picker.err == "" && !m.picker.loading {
+		return "未获取到模型，按 Ctrl+R 重试"
+	}
+
+	segments := make([]string, 0, 3)
+	if m.form.modelOptionsSource != "" {
+		segments = append(segments, "来源 "+m.form.modelOptionsSource)
+	}
+	segments = append(segments,
+		fmt.Sprintf("共 %d 个模型", len(m.form.modelOptions)),
+		fmt.Sprintf("匹配 %d 个", len(m.picker.filtered)),
+	)
+	return strings.Join(segments, " · ")
+}
+
+// formFieldWindow 返回当前可见的字段区间，保证聚焦字段始终在窗口内。
+func (m *Model) formFieldWindow(helpLineCount int) (int, int) {
+	total := len(m.form.fields)
+	if total == 0 {
+		return 0, 0
+	}
+
+	// 头部与空行 + 面板边框与内边距 + 标题/提示/空行 + 滚动指示与错误预留
+	overhead := 2 + 4 + 3 + 3 + helpLineCount
+	visible := (m.height - overhead) / formFieldLines
+	if visible > total {
+		visible = total
+	}
+	if visible < 1 {
+		visible = 1
+	}
+
+	start := 0
+	if m.form.focusIndex >= visible {
+		start = m.form.focusIndex - visible + 1
+	}
+	if start > total-visible {
+		start = total - visible
+	}
+
+	return start, start + visible
 }
 
 func (m *Model) viewConfirm() string {
@@ -779,10 +1156,32 @@ func (m *Model) selectedProviderStatusSegments() []string {
 	}
 
 	segments := []string{"Base URL: " + baseURL}
+	if row.app == ccswitch.AppClaude {
+		if models := distinctModels(input); models != "" {
+			segments = append(segments, "Model: "+models)
+		}
+	}
 	if website := strings.TrimSpace(input.Website); website != "" {
 		segments = append(segments, "Website: "+website)
 	}
 	return segments
+}
+
+func distinctModels(input ccswitch.ProviderInput) string {
+	seen := map[string]struct{}{}
+	values := make([]string, 0, 5)
+	for _, model := range []string{input.Model, input.ModelFable, input.ModelHaiku, input.ModelSonnet, input.ModelOpus, input.ModelSubagent} {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if _, exists := seen[model]; exists {
+			continue
+		}
+		seen[model] = struct{}{}
+		values = append(values, model)
+	}
+	return strings.Join(values, " / ")
 }
 
 func (m *Model) renderHelpLines() []string {
@@ -793,7 +1192,15 @@ func (m *Model) renderHelpLines() []string {
 			help("Enter", "下一项/保存"),
 			help("Tab", "下一项"),
 			help("Shift+Tab", "上一项"),
+			help("Ctrl+L", "获取模型"),
 			help("Ctrl+S", "保存"),
+			help("Esc", "返回"),
+		}
+	case modeModelPicker:
+		items = []string{
+			help("↑/↓", "移动"),
+			help("Enter", "选择"),
+			help("Ctrl+R", "重新获取"),
 			help("Esc", "返回"),
 		}
 	case modeConfirm:
@@ -832,6 +1239,11 @@ func newFormState(app ccswitch.AppType, provider *ccswitch.Provider, input ccswi
 		input.BaseURL,
 		input.APIKey,
 		input.Model,
+	}
+
+	if app == ccswitch.AppClaude {
+		labels = append(labels, "Fable Model", "Haiku Model", "Sonnet Model", "Opus Model", "Subagent Model")
+		values = append(values, input.ModelFable, input.ModelHaiku, input.ModelSonnet, input.ModelOpus, input.ModelSubagent)
 	}
 
 	if app == ccswitch.AppCodex {
@@ -899,6 +1311,14 @@ func (m *Model) formInput() ccswitch.ProviderInput {
 	}
 
 	next := 4
+	if m.form.app == ccswitch.AppClaude {
+		input.ModelFable = field(next)
+		input.ModelHaiku = field(next + 1)
+		input.ModelSonnet = field(next + 2)
+		input.ModelOpus = field(next + 3)
+		input.ModelSubagent = field(next + 4)
+		next += 5
+	}
 	if m.form.app == ccswitch.AppCodex {
 		input.ReasoningEffort = field(next)
 		next++
@@ -951,6 +1371,8 @@ func (m *Model) modeLabel() string {
 		return "新增"
 	case modeConfirm:
 		return "确认"
+	case modeModelPicker:
+		return "选择模型"
 	default:
 		return "列表"
 	}
@@ -1024,6 +1446,8 @@ func placeholderFor(app ccswitch.AppType, label string) string {
 		}
 	case "Reasoning Effort":
 		return "e.g. medium / high"
+	case "Fable Model", "Haiku Model", "Sonnet Model", "Opus Model", "Subagent Model":
+		return "Optional: empty inherits Model"
 	case "Website":
 		return "Optional: provider website"
 	case "Notes":

@@ -1,6 +1,7 @@
 package ccswitch
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -75,21 +76,79 @@ func (s *Store) Bootstrap() ([]string, error) {
 		if err != nil {
 			return warnings, err
 		}
-		if len(providers) > 0 {
+		if len(providers) == 0 {
+			imported, err := s.importCurrentLive(app)
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("%s 导入失败: %v", app.DisplayName(), err))
+				continue
+			}
+			if imported {
+				warnings = append(warnings, fmt.Sprintf("已导入 %s 当前 live 配置", app.DisplayName()))
+			}
 			continue
 		}
 
-		imported, err := s.importCurrentLive(app)
+		synced, err := s.syncCurrentFromLive(app)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("%s 导入失败: %v", app.DisplayName(), err))
+			warnings = append(warnings, fmt.Sprintf("%s 同步 live 配置失败: %v", app.DisplayName(), err))
 			continue
 		}
-		if imported {
-			warnings = append(warnings, fmt.Sprintf("已导入 %s 当前 live 配置", app.DisplayName()))
+		if synced {
+			warnings = append(warnings, fmt.Sprintf("已按 live 配置更新 %s 的当前供应商", app.DisplayName()))
 		}
 	}
 
 	return warnings, nil
+}
+
+// syncCurrentFromLive 用 live 配置刷新当前供应商记录，保留外部手动改动。
+// 增量模式（多供应商共存于同一文件）不适用。
+func (s *Store) syncCurrentFromLive(app AppType) (bool, error) {
+	if app.IsIncremental() {
+		return false, nil
+	}
+
+	current, err := s.GetEffectiveCurrentProvider(app)
+	if err != nil {
+		return false, err
+	}
+	if current == "" {
+		return false, nil
+	}
+
+	target, err := s.GetProvider(app, current)
+	if err != nil {
+		return false, err
+	}
+	if target == nil {
+		return false, nil
+	}
+
+	live, err := s.readLiveSettings(app)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	liveJSON, err := json.Marshal(live)
+	if err != nil {
+		return false, err
+	}
+	storedJSON, err := json.Marshal(target.SettingsConfig)
+	if err != nil {
+		return false, err
+	}
+	if bytes.Equal(liveJSON, storedJSON) {
+		return false, nil
+	}
+
+	target.SettingsConfig = live
+	if err := s.saveProviderRow(app, *target); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) Snapshot() (*Snapshot, error) {
@@ -446,17 +505,17 @@ func (s *Store) ExtractInput(app AppType, provider Provider) ProviderInput {
 		}
 
 		return ProviderInput{
-			Name:    provider.Name,
-			BaseURL: stringValue(env["ANTHROPIC_BASE_URL"]),
-			APIKey:  apiKey,
-			Model: firstNonEmpty(
-				stringValue(env["ANTHROPIC_MODEL"]),
-				stringValue(env["ANTHROPIC_DEFAULT_SONNET_MODEL"]),
-				stringValue(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"]),
-				stringValue(env["ANTHROPIC_DEFAULT_OPUS_MODEL"]),
-			),
-			Website: deref(provider.WebsiteURL),
-			Notes:   deref(provider.Notes),
+			Name:          provider.Name,
+			BaseURL:       stringValue(env["ANTHROPIC_BASE_URL"]),
+			APIKey:        apiKey,
+			Model:         stringValue(env["ANTHROPIC_MODEL"]),
+			ModelFable:    stringValue(env["ANTHROPIC_DEFAULT_FABLE_MODEL"]),
+			ModelHaiku:    stringValue(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"]),
+			ModelSonnet:   stringValue(env["ANTHROPIC_DEFAULT_SONNET_MODEL"]),
+			ModelOpus:     stringValue(env["ANTHROPIC_DEFAULT_OPUS_MODEL"]),
+			ModelSubagent: stringValue(env["CLAUDE_CODE_SUBAGENT_MODEL"]),
+			Website:       deref(provider.WebsiteURL),
+			Notes:         deref(provider.Notes),
 		}
 	case AppCodex:
 		auth := getOrCreateMap(provider.SettingsConfig, "auth")
@@ -758,17 +817,19 @@ func (s *Store) buildProvider(app AppType, existing *Provider, input ProviderInp
 		patchStringField(env, "ANTHROPIC_BASE_URL", input.BaseURL)
 
 		model := strings.TrimSpace(input.Model)
-		if model == "" {
-			delete(env, "ANTHROPIC_MODEL")
-			delete(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL")
-			delete(env, "ANTHROPIC_DEFAULT_SONNET_MODEL")
-			delete(env, "ANTHROPIC_DEFAULT_OPUS_MODEL")
-		} else {
-			env["ANTHROPIC_MODEL"] = model
-			env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
-			env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
-			env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+		patchStringField(env, "ANTHROPIC_MODEL", model)
+		// 别名模型与子代理模型留空时跟随主模型，别名显示名与模型值保持一致
+		for _, item := range []struct{ key, nameKey, value string }{
+			{"ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME", input.ModelFable},
+			{"ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME", input.ModelHaiku},
+			{"ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME", input.ModelSonnet},
+			{"ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME", input.ModelOpus},
+		} {
+			value := firstNonEmpty(item.value, model)
+			patchStringField(env, item.key, value)
+			patchStringField(env, item.nameKey, value)
 		}
+		patchStringField(env, "CLAUDE_CODE_SUBAGENT_MODEL", firstNonEmpty(input.ModelSubagent, model))
 
 		settings["env"] = env
 		provider.SettingsConfig = settings

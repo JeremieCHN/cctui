@@ -17,6 +17,8 @@
 - 首次启动时，如果某个应用还没有保存的供应商，会尝试导入当前 live 配置
 - 切换前会先读取当前 live 配置并回写数据库，尽量保留你在外部手动改过的内容
 - 支持新增、编辑、删除、切换供应商
+- `Claude` 支持分别配置主模型、`Fable`、`Haiku`、`Sonnet`、`Opus` 默认模型与子代理模型
+- 模型字段可按 `Ctrl+L` 从供应商拉取模型列表并选择，不必手输
 - `Codex` 额外支持配置 `Reasoning Effort`
 
 ## 管理的配置文件
@@ -109,8 +111,26 @@ go build -o cctui .
 
 - `Tab` / `Shift+Tab`：切换字段
 - `Enter`：下一项，最后一项时保存
+- `Ctrl+L`：聚焦在模型字段时，从 `Base URL` 拉取模型列表并选择
 - `Ctrl+S`：保存
 - `q`：取消并返回
+
+模型选择器内：
+
+- 直接输入关键字筛选
+- `↑/↓`：移动光标
+- `Enter`：选中并写回字段
+- `Ctrl+R`：重新拉取
+- `Esc`：返回表单
+
+## 模型列表
+
+聚焦到模型字段（`Model`、`Fable Model` 等）按 `Ctrl+L`，会用当前表单里的 `Base URL` 与 `API Key` 拉取可用模型：
+
+- 先请求 `{Base URL}/v1/models`（OpenAI 兼容，返回当前 key 可用的模型）
+- 失败时回退到 `{Base URL}/api/pricing`（new-api 模型广场的公开接口，不需要 key）
+
+拉到的列表在同一个表单会话内缓存，切换字段后再次打开不会重复请求，按 `Ctrl+R` 可以强制刷新。
 
 ## 供应商字段说明
 
@@ -123,6 +143,13 @@ go build -o cctui .
 - `Website`：可选，供应商官网
 - `Notes`：可选，备注
 
+`Claude` 独有字段：
+
+- `Fable Model` / `Haiku Model` / `Sonnet Model` / `Opus Model`：分别对应 `ANTHROPIC_DEFAULT_FABLE_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`，用于覆盖对应模型别名解析到的模型
+- `Subagent Model`：对应 `CLAUDE_CODE_SUBAGENT_MODEL`，子代理使用的模型
+- 以上字段留空时跟随 `Model`（`ANTHROPIC_MODEL`）：只填 `Model` 时这些环境变量写入同一个值；全部留空时不写入这些环境变量
+- 保存时会同步写入 `ANTHROPIC_DEFAULT_<别名>_MODEL_NAME`，与对应模型值保持一致
+
 `Codex` 独有字段：
 
 - `Reasoning Effort`：例如 `medium`、`high`
@@ -132,6 +159,10 @@ go build -o cctui .
 ### 首次启动导入
 
 如果某个应用在数据库里还没有供应商，程序会尝试读取该应用当前正在使用的 live 配置，并自动导入一条记录，例如 `Imported Claude`。
+
+### 启动时同步
+
+启动时会读取每个应用（不含增量模式的 `Opencode`）的 live 配置，与数据库中当前供应商的记录对比；发现不同时以 live 为准更新记录，你在外部手动改过的内容会立即反映到 TUI 中。
 
 ### 切换时同步
 
