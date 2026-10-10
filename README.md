@@ -59,40 +59,29 @@ go build -o cctui .
 ./cctui
 ```
 
-## AUR 自动发布
+## GitHub Actions 构建与发布
 
-仓库内置了 GitHub Actions workflow：当你给 GitHub 仓库 push 一个 tag 时，会自动更新 AUR 仓库：
+仓库内置了两个 workflow：
 
-- AUR 仓库地址：`aur@aur.archlinux.org:cctui.git`
-- Workflow 文件：`.github/workflows/publish-aur.yml`
-- 生成脚本：`scripts/update-aur.sh`
+- `CI`（`.github/workflows/ci.yml`）：在 push 到 `main`、提交 PR 或手动触发时，执行 `gofmt` 检查、`go vet`、`go test` 与一次构建。
+- `Release`（`.github/workflows/release.yml`）：在 Actions 页面手动触发，交叉编译 `linux`/`darwin` 的 `amd64`、`arm64` 以及 `windows/amd64` 二进制，生成 `sha256` 校验文件，并在固定的 `latest` tag 上创建或覆盖更新 GitHub Release。
 
-### GitHub Secret
+### 发布一次
 
-你需要在 GitHub 仓库里配置一个 secret：
+1. 打开仓库的 `Actions` 页面，选择 `Release` workflow。
+2. 点击 `Run workflow`，无需填写任何内容。
+3. 运行结束后，产物会出现在 `Releases` 页面，下载地址固定为 `https://github.com/<owner>/<repo>/releases/latest`。
 
-- `AUR_SSH_PRIVATE_KEY`
+每次触发都会把 `latest` tag 移动到当次构建的 commit，并用新产物覆盖旧产物，所以 Releases 页面始终只有这一个 Release，下载链接长期不变，适合小范围持续分发。
 
-它应该对应一个有权限 push 到 `aur@aur.archlinux.org:cctui.git` 的 SSH 私钥。
+产物命名形如 `cctui-linux-amd64`、`cctui-darwin-arm64`、`cctui-windows-amd64.exe`，并各自附带 `.sha256` 文件。Release 说明中会记录本次构建的完整 commit。
 
-### 本地测试 AUR 生成
+### 说明
 
-你已经在本地准备了测试仓库 `~/test/cctui`，可以这样测试：
-
-```bash
-./scripts/update-aur.sh \
-  --tag v0.0.0 \
-  --aur-dir ~/test/cctui \
-  --archive-url https://github.com/manateelazycat/cctui/archive/refs/heads/main.tar.gz \
-  --archive-dir-name cctui-main \
-  --validate
-```
-
-这条命令会：
-
-- 生成 `PKGBUILD`
-- 生成 `.SRCINFO`
-- 用 `makepkg --printsrcinfo` 校验 `.SRCINFO` 是否正确
+- 不需要配置任何 secret。
+- 全程无需手动打 tag：workflow 会自动创建或移动固定的 `latest` tag。
+- Release 需要仓库的 Workflow 权限允许写入（`Settings -> Actions -> General -> Workflow permissions` 选择 `Read and write permissions`，或依赖 job 内的 `permissions: contents: write`）。
+- `latest` 是一个会被强制移动的 tag，本地 `git fetch --tags` 时可能需要加 `-f` 才能同步。
 
 ## 使用方式
 
